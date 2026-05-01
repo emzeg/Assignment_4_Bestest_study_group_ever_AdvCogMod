@@ -1,0 +1,120 @@
+---
+title: "Data simulation"
+author: "Emma Rose Hahn"
+date: "2026-05-01"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+set.seed(020801)
+```
+
+```{r}
+# load packages
+
+pacman::p_load(
+  tidyverse, # Data manipulation and plotting
+  dplyr,
+  here,         # Robust file paths
+  cmdstanr,
+  ggplot2,     # Stan interface
+  posterior,    # Posterior analysis
+  bayesplot,
+  hrbrthemes# Plotting MCMC
+)
+```
+
+
+```{r}
+# Generative GCM model function. idk im just testing things, this is largerly just riccardos code
+gcm_simulate <- function(w,            # attention weights (sums to 1)
+                         c,            # sensitivity (natural scale, strictly positive)
+                         bias,         # response bias towards category 1
+                         obs,          # matrix of stimulus features (trials x features) 
+                         cat_feedback, # true category labels (0 or 1)
+                         quiet = TRUE) {
+  ntrials   <- nrow(32)
+  nfeatures <- ncol(5)
+
+  prob_cat1    <- numeric(ntrials)
+  sim_response <- numeric(ntrials)
+
+  memory_obs <- matrix(NA_real_, nrow = 0, ncol = nfeatures)
+  memory_cat <- numeric(0)
+
+  for (i in seq_len(ntrials)) {
+    if (!quiet && i %% 20 == 0) cat("Simulating trial:", i, "\n")
+
+    current_stim <- as.numeric(obs[i, ])
+    n_mem        <- nrow(memory_obs)
+    has_cat0     <- any(memory_cat == 0)
+    has_cat1     <- any(memory_cat == 1)
+
+    if (n_mem == 0 || !has_cat0 || !has_cat1) {
+      prob_cat1[i] <- bias
+    } else {
+      sims <- vapply(seq_len(n_mem), function(e) {
+        similarity(distance(current_stim, memory_obs[e, ], w), c)
+      }, numeric(1))
+
+      # Mean similarity per category — removes category-frequency bias.
+      m1  <- mean(sims[memory_cat == 1])
+      m0  <- mean(sims[memory_cat == 0])
+      num <- bias * m1
+      den <- num + (1 - bias) * m0
+
+      prob_cat1[i] <- if (den > 1e-9) num / den else bias
+      prob_cat1[i] <- pmax(1e-9, pmin(1 - 1e-9, prob_cat1[i]))
+    }
+
+    sim_response[i] <- rbinom(1, 1, prob_cat1[i])
+
+    memory_obs <- rbind(memory_obs, current_stim)
+    memory_cat <- c(memory_cat, cat_feedback[i])
+  }
+
+  tibble(prob_cat1 = prob_cat1, sim_response = sim_response)
+}
+```
+
+```{r}
+#making the alien stimulus information
+n_aliens <- 32
+n_blocks <- 1
+n_trials_per_block <- n_aliens
+total_trials <- n_blocks * n_trials_per_block 
+
+stimulus_info <- tibble(
+  alien_id      = 1:32,
+  eye_stalks    = c(1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 0, 0, 1, 1, 1, 1, 0, 0, 1, 1, 1, 1, 0, 1, 1),
+  colour_green  = c(1, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 1, 1, 0, 0, 1, 0, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 0, 0),
+  slim_legs     = c(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 1, 1, 1, 0, 0, 0, 0, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1),
+  arms_up       = c(1, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 1, 0, 1, 1, 1, 1, 1, 0, 0, 1, 1, 1, 1, 0, 1, 0, 1, 0),
+  spots         = c(1, 0, 1, 0, 0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 1, 1, 1, 0, 1, 0, 0, 1, 1, 1, 1, 0, 1, 0, 1),
+  
+  category_true = c(eye_stalks == 1 & spots == 1) * 1
+)
+
+sum(stimulus_info$category_true)
+
+ggplot(stimulus_info, aes(x = eye_stalks, y = spots,
+                          color = factor(category_true), label = alien_id)) +
+  geom_point(size = 5) +
+  geom_text(nudge_y = 0.18) +
+  scale_color_manual(values = c("0" = "#0072B2", "1" = "#D55E00"), name = "Category") +
+  labs(title = "Stimulus Structure", x = "eye_stalks", y = "spots") +
+  coord_fixed()
+
+library(tidyverse)
+
+stimulus_info %>%
+  select(-category_true) %>%
+  pivot_longer(cols = -alien_id,
+               names_to = "feature", values_to = "value") %>%
+  ggplot(aes(x = feature, y = factor(alien_id), fill = factor(value))) +
+  geom_tile() +
+  scale_fill_manual(values = c("0" = "lightgreen", "1" = "hotpink"), name = "Value") +
+  labs(title = "Stimulus Features", x = "Feature", y = "Alien ID")
+```
+
