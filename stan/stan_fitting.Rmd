@@ -1,0 +1,84 @@
+---
+title: "Stan fitting"
+author: "Emma Rose Hahn"
+date: "2026-05-05"
+output: html_document
+---
+
+
+```{r}
+# Define prior parameters
+LOG_C_PRIOR_MEAN <- log(2)
+LOG_C_PRIOR_SD <- 1
+
+# Select one simulated agent: w ≈ (0.9, 0.1), c ≈ 2
+agent_to_fit <- simulated_responses |>
+  filter(
+    round(w1_true, 1) == 0.9,
+    abs(log_c_true - log(2.0)) == min(abs(log_c_true - log(2.0)))
+  ) |>
+  filter(agent_id == min(agent_id)) |>
+  slice(1:total_trials)
+
+stopifnot(nrow(agent_to_fit) == total_trials)
+
+# Prepare Stan data with all 5 alien features
+gcm_data_single <- list(
+  N_total           = nrow(agent_to_fit),
+  N_features        = 5L, 
+  y                 = as.integer(agent_to_fit$sim_response),
+  obs               = as.matrix(agent_to_fit[, c("eye_stalks", "colour_green", "slim_legs", "arms_up", "spots")]),
+  cat_feedback      = as.integer(agent_to_fit$category_feedback),
+  prior_w_alpha     = c(10, 0.5, 0.5, 0.5, 0.5),  # Focussing begins on feature 1
+  prior_log_c_mu    = LOG_C_PRIOR_MEAN,
+  prior_log_c_sigma = LOG_C_PRIOR_SD,
+  prior_bias_alpha  = 1,
+  prior_bias_beta   = 1,
+  run_diagnostics   = 1L
+)
+
+# Create simmodels directory
+
+# Write ONLY the Stan code (no R assignment)
+mod_gcm_single <- cmdstan_model(here("stan/stALIEN.stan"))
+
+dir.create(here("simmodels"), showWarnings = FALSE)
+
+fit_filepath_single <- here("simmodels", "stALIEN_running.rds")
+
+
+
+if (regenerate_simulations || !file.exists(fit_filepath_single)) {
+  pf_single <- tryCatch(
+    mod_gcm_single$pathfinder(
+      data      = ch12_gcm_simulated_responses,
+      seed      = 123,
+      num_paths = 4,
+      refresh   = 0
+    ),
+    error = function(e) {
+      message("Pathfinder failed — falling back to default initialisation.")
+      NULL
+    }
+  )
+  
+  
+  fit_gcm_single <- mod_gcm_single$sample(
+    data            = gcm_data_single,
+    init            = pf_single,
+    seed            = 123,
+    chains          = 4,
+    parallel_chains = min(4, availableCores()),
+    iter_warmup     = 1000,
+    iter_sampling   = 1500,
+    refresh         = 300,
+    adapt_delta     = 0.9
+  )
+  fit_gcm_single$save_object(fit_filepath_single)
+  cat("Single-agent model fitted and saved.\n")
+} else {
+  fit_gcm_single <- readRDS(fit_filepath_single)
+  cat("Loaded existing single-agent fit.\n")
+}
+```
+
