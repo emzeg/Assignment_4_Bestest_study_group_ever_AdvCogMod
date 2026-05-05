@@ -21,7 +21,8 @@ pacman::p_load(
   ggplot2,     # Stan interface
   posterior,    # Posterior analysis
   bayesplot,
-  hrbrthemes# Plotting MCMC
+  hrbrthemes, # Plotting MCMC
+  plan
 )
 ```
 
@@ -34,8 +35,8 @@ gcm_simulate <- function(w,            # attention weights (sums to 1)
                          obs,          # matrix of stimulus features (trials x features) 
                          cat_feedback, # true category labels (0 or 1)
                          quiet = TRUE) {
-  ntrials   <- nrow(32)
-  nfeatures <- ncol(5)
+  ntrials   <- nrow(obs)
+  nfeatures <- ncol(obs)
 
   prob_cat1    <- numeric(ntrials)
   sim_response <- numeric(ntrials)
@@ -116,5 +117,160 @@ stimulus_info %>%
   geom_tile() +
   scale_fill_manual(values = c("0" = "lightgreen", "1" = "hotpink"), name = "Value") +
   labs(title = "Stimulus Features", x = "Feature", y = "Alien ID")
+```
+```{r}
+#subject schedule, i dont quite get it but just putting our stuff into riccardos code
+make_subject_schedule <- function(stimulus_info, n_blocks, seed) {
+  set.seed(020801)
+  n_stim <- nrow(stimulus_info)
+
+  sequence <- unlist(lapply(seq_len(n_blocks), function(b) {
+    sample(stimulus_info$alien_id, n_aliens, replace = FALSE)
+  }))
+
+  tibble(
+    trial_within_subject = seq_along(sequence),
+    block                = rep(seq_len(n_blocks), each = n_aliens),
+    stimulus_id          = sequence
+  ) |>
+    left_join(stimulus_info, by = c("alien_id" = "stimulus")) |>
+    rename(category_feedback = category_true) |>
+    dplyr::select(trial_within_subject, block, stimulus_id,
+                  height, position, category_feedback)
+}
+```
+
+```{r}
+#simulating a gcm agent 
+simulate_gcm_agent <- function(agent_id, w_true, c_true, bias_true,
+                               stimulus_info, n_blocks, subject_seed) {
+  schedule <- make_subject_schedule(stimulus_info, n_blocks, seed = subject_seed)
+  obs      <- schedule |> dplyr::select(eye_stalks, colour_green, slim_legs, arms_up, spots)
+  feedback <- schedule$category_feedback
+
+  sim_results <- gcm_simulate(
+    w = w_true, c = c_true, bias = bias_true,
+    obs = obs, cat_feedback = feedback, quiet = TRUE
+  )
+
+  schedule |>
+    mutate(
+      agent_id     = agent_id,
+      w1_true      = w_true[1],
+      w2_true      = w_true[2],
+      c_true       = c_true,
+      log_c_true   = log(c_true),
+      bias_true    = bias_true,
+      prob_cat1    = sim_results$prob_cat1,
+      sim_response = sim_results$sim_response,
+      correct      = as.integer(category_feedback == sim_response)
+    ) |>
+    group_by(agent_id) |>
+    mutate(performance = cumsum(correct) / row_number()) |>
+    ungroup()
+}
+```
+
+```{r}
+library(plan)
+
+param_grid <- expand_grid(
+  w_setting    = list(c(0.5, 0.5), c(0.7, 0.3), c(0.9, 0.1)),
+  c_setting    = c(0.5, 1.0, 2.0, 4.0, 5.0, 15.0),
+  bias_setting = 0.5
+) |>
+  mutate(
+    setting_id = row_number(),
+    w_label    = map_chr(w_setting, ~paste(round(.x, 1), collapse = ",")),
+    c_label    = paste0("c≈", round(c_setting, 1)),
+    label      = paste0("w=(", w_label, "), ", c_label)
+  )
+
+n_agents_per_setting <- 5
+
+simulation_plan <- param_grid |>
+  uncount(n_agents_per_setting) |>
+  mutate(agent_id = row_number())
+
+sim_file <- here("simdata", "ch12_gcm_simulated_responses.csv")
+
+regenerate_simulations = FALSE
+
+if (regenerate_simulations || !file.exists(sim_file)) {
+  plan(multisession, workers = max(1, availableCores() - 1))
+
+  simulated_responses <- future_pmap_dfr(
+    list(
+      agent_id  = simulation_plan$agent_id,
+      w_true    = simulation_plan$w_setting,
+      c_true    = simulation_plan$c_setting,
+      bias_true = simulation_plan$bias_setting
+    ),
+    simulate_gcm_agent,
+    stimulus_info = stimulus_info,
+    n_blocks      = n_blocks,
+    subject_seed  = simulation_plan$agent_id,
+    .options = furrr_options(seed = TRUE)
+  )
+
+  plan(sequential)
+  write_csv(simulated_responses, sim_file)
+  cat("Simulation complete. Results saved.\n")
+} else {
+  simulated_responses <- read_csv(sim_file, show_col_types = FALSE)
+  cat("Loaded existing simulation results.\n")
+}
+```
+
+```{r}
+simulated_responses_labeled <- simulated_responses |>
+  mutate(
+    w_label = paste0("w=(", round(w1_true, 1), ",", round(w2_true, 1), ")"),
+    c_label = paste0("c≈", round(c_true, 1)),
+    # Order the c_label factor based on the numeric c_true values
+    c_label = forcats::fct_reorder(c_label, c_true) 
+  )
+
+p_c_effect <- ggplot(
+  simulated_responses_labeled,
+  aes(x = trial_within_subject, y = performance,
+      color = factor(round(c_true, 1)),
+      group = interaction(agent_id, round(c_true, 1)))
+) +
+  stat_summary(fun = mean, geom = "line",
+               aes(group = factor(round(c_true, 1))), linewidth = 1.2) +
+  facet_wrap(~w_label) +
+  scale_color_viridis_d(option = "plasma", name = "Sensitivity (c)") +
+  labs(
+    title    = "Effect of Sensitivity (c) on GCM Learning",
+    subtitle = "Mean across simulated agents",
+    x = "Trial", y = "Cumulative Accuracy"
+  ) +
+  theme(legend.position = "bottom")
+
+p_w_effect <- ggplot(
+  simulated_responses_labeled,
+  aes(x = trial_within_subject, y = performance,
+      color = w_label, group = interaction(agent_id, w_label))
+) +
+  stat_summary(fun = mean, geom = "line", aes(group = w_label), linewidth = 1.2) +
+  facet_wrap(~c_label) +
+  scale_color_brewer(palette = "Set1", name = "Attention Weights") +
+  labs(
+    title    = "Effect of Attention Weights (w) on GCM Learning",
+    subtitle = "Mean across simulated agents",
+    x = "Trial", y = "Cumulative Accuracy"
+  ) +
+  theme(legend.position = "bottom")
+
+p_c_effect
+```
+
+
+```{r}
+```
+
+
+```{r}
 ```
 
