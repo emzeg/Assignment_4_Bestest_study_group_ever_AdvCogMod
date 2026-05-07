@@ -5,13 +5,31 @@ date: "2026-05-05"
 output: html_document
 ---
 
+```{r}
+
+pacman::p_load(
+  tidyverse, # Data manipulation and plotting
+  dplyr,
+  here,         # Robust file paths
+  cmdstanr, # Stan interface
+  ggplot2,     
+  posterior,    # Posterior analysis
+  bayesplot,
+  hrbrthemes, # Plotting MCMC
+  plan,
+  future, #for the plan function
+  furrr
+)
+```
+
+
 
 ```{r}
 # Define prior parameters
-LOG_C_PRIOR_MEAN <- log(2)
-LOG_C_PRIOR_SD <- 1
+#LOG_C_PRIOR_MEAN <- log(2)
+#LOG_C_PRIOR_SD <- 1
 
-# Select one simulated agent: w ≈ (0.9, 0.1), c ≈ 2
+# Select one simulated agent with specific parameters
 agent_to_fit <- simulated_responses |>
   filter(
     round(w1_true, 1) == 0.9,
@@ -22,14 +40,14 @@ agent_to_fit <- simulated_responses |>
 
 stopifnot(nrow(agent_to_fit) == total_trials)
 
-# Prepare Stan data with all 5 alien features
+# Prepare data with all 5 alien features
 gcm_data_single <- list(
   N_total           = nrow(agent_to_fit),
-  N_features        = 5L, 
+  N_features        = 5L,  # 5 alien features
   y                 = as.integer(agent_to_fit$sim_response),
   obs               = as.matrix(agent_to_fit[, c("eye_stalks", "colour_green", "slim_legs", "arms_up", "spots")]),
   cat_feedback      = as.integer(agent_to_fit$category_feedback),
-  prior_w_alpha     = c(10, 0.5, 0.5, 0.5, 0.5),  # Focussing begins on feature 1
+  prior_w_alpha     = c(1, 1, 1, 1, 1),  # Uniform prior on 5 features
   prior_log_c_mu    = LOG_C_PRIOR_MEAN,
   prior_log_c_sigma = LOG_C_PRIOR_SD,
   prior_bias_alpha  = 1,
@@ -37,21 +55,13 @@ gcm_data_single <- list(
   run_diagnostics   = 1L
 )
 
-# Create simmodels directory
-
-# Write ONLY the Stan code (no R assignment)
-mod_gcm_single <- cmdstan_model(here("stan/stALIEN.stan"))
-
 dir.create(here("simmodels"), showWarnings = FALSE)
-
-fit_filepath_single <- here("simmodels", "stALIEN_running.rds")
-
-
+fit_filepath_single <- here("simmodels", "stALIEN_fit.rds")
 
 if (regenerate_simulations || !file.exists(fit_filepath_single)) {
   pf_single <- tryCatch(
     mod_gcm_single$pathfinder(
-      data      = ch12_gcm_simulated_responses,
+      data      = gcm_data_single,
       seed      = 123,
       num_paths = 4,
       refresh   = 0
@@ -61,7 +71,6 @@ if (regenerate_simulations || !file.exists(fit_filepath_single)) {
       NULL
     }
   )
-  
   
   fit_gcm_single <- mod_gcm_single$sample(
     data            = gcm_data_single,
@@ -79,6 +88,49 @@ if (regenerate_simulations || !file.exists(fit_filepath_single)) {
 } else {
   fit_gcm_single <- readRDS(fit_filepath_single)
   cat("Loaded existing single-agent fit.\n")
+}
+```
+
+```{r}
+diagnostic_summary_table <- function(fit, params) {
+  summary_tbl <- fit$summary(params)
+  
+  # Check diagnostics
+  summary_tbl <- summary_tbl %>%
+    mutate(
+      rhat_pass = rhat < 1.01 | is.na(rhat),
+      ess_pass = ess_tail > 400 | is.na(ess_tail),
+      pass = rhat_pass & ess_pass
+    ) %>%
+    select(variable, mean, sd, rhat, ess_bulk, ess_tail, pass)
+  
+  return(as.data.frame(summary_tbl))  # ← Convert to data.frame
+}
+```
+
+
+
+```{r}
+
+if (!is.null(fit_gcm_single)) {
+  diag_tbl <- diagnostic_summary_table(
+    fit_gcm_single,
+    params = c("w[1]", "w[2]", "log_c", "c", "bias")
+  )
+  print(diag_tbl)
+
+  if (!all(diag_tbl$pass)) {
+    warning("Diagnostic battery has failures — interpret posteriors with caution.")
+  }
+
+  bayesplot::mcmc_trace(
+    fit_gcm_single$draws(c("log_c", "w[1]", "bias")),
+    facet_args = list(ncol = 1)
+  )
+
+  bayesplot::mcmc_rank_overlay(
+    fit_gcm_single$draws(c("log_c", "w[1]", "bias"))
+  )
 }
 ```
 
