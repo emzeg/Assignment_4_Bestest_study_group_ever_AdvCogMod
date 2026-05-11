@@ -111,7 +111,7 @@ diagnostic_summary_table <- function(fit, params) {
     ) %>%
     select(variable, mean, sd, rhat, ess_bulk, ess_tail, pass)
   
-  return(as.data.frame(summary_tbl))  # ← Convert to data.frame
+  return(as.data.frame(summary_tbl))  
 }
 
 ```
