@@ -18,10 +18,13 @@ pacman::p_load(
   hrbrthemes, # Plotting MCMC
   plan,
   future, #for the plan function
-  furrr
+  furrr,
+  patchwork,
+  posterior,
+  hexbin
 )
-```
 
+```
 
 
 ```{r}
@@ -29,10 +32,14 @@ pacman::p_load(
 #LOG_C_PRIOR_MEAN <- log(2)
 #LOG_C_PRIOR_SD <- 1
 
-# Select one simulated agent with specific parameters
+# SelectING THE simulated agent with the best performance specific parameters
 agent_to_fit <- simulated_responses |>
   filter(
-    round(w1_true, 1) == 0.9,
+    round(w1_true, 2) == 0.50,
+    round(w2_true, 2) == 0.25,
+    round(w3_true, 2) == 0.15,
+    round(w4_true, 2) == 0.07,
+    round(w5_true, 2) == 0.03,
     abs(log_c_true - log(2.0)) == min(abs(log_c_true - log(2.0)))
   ) |>
   filter(agent_id == min(agent_id)) |>
@@ -106,6 +113,7 @@ diagnostic_summary_table <- function(fit, params) {
   
   return(as.data.frame(summary_tbl))  # ← Convert to data.frame
 }
+
 ```
 
 
@@ -114,23 +122,135 @@ diagnostic_summary_table <- function(fit, params) {
 
 if (!is.null(fit_gcm_single)) {
   diag_tbl <- diagnostic_summary_table(
-    fit_gcm_single,
-    params = c("w[1]", "w[2]", "log_c", "c", "bias")
-  )
+  fit_gcm_single,
+  params = c("w[1]", "w[2]", "w[3]", "w[4]", "w[5]", "log_c", "c", "bias")
+)
   print(diag_tbl)
 
   if (!all(diag_tbl$pass)) {
     warning("Diagnostic battery has failures — interpret posteriors with caution.")
   }
+  
 
-  bayesplot::mcmc_trace(
-    fit_gcm_single$draws(c("log_c", "w[1]", "bias")),
-    facet_args = list(ncol = 1)
-  )
+bayesplot::mcmc_trace(
+  fit_gcm_single$draws(c("log_c", "w[1]", "w[2]", "w[3]", "w[4]", "w[5]", "bias")),
+  facet_args = list(ncol = 1)
+) +
+  scale_fill_manual(values = c("#FF7518", "#FFBF00", "#6395EE", "#000080")) +
+  scale_color_manual(values = c("#FF7518", "#FFBF00", "#6395EE", "#000080"))
 
-  bayesplot::mcmc_rank_overlay(
-    fit_gcm_single$draws(c("log_c", "w[1]", "bias"))
-  )
+bayesplot::mcmc_rank_overlay(
+  fit_gcm_single$draws(c("log_c", "w[1]", "w[2]", "w[3]", "w[4]", "w[5]", "bias"))
+) +
+  scale_fill_manual(values = c("#FF7518", "#FFBF00", "#6395EE", "#000080")) +
+  scale_color_manual(values = c("#FF7518", "#FFBF00", "#6395EE", "#000080"))
 }
+```
+```{r}
+if (!is.null(fit_gcm_single)) {
+  prob_draws <- fit_gcm_single$draws("prob_cat1", format = "matrix")
+  n_draws    <- nrow(prob_draws)
+  n_trials   <- ncol(prob_draws)
+
+  set.seed(2025)
+  yrep_post <- matrix(rbinom(n_draws * n_trials, 1, as.vector(prob_draws)),
+                      nrow = n_draws)
+
+  obs_acc <- cummean(agent_to_fit$sim_response == agent_to_fit$category_feedback)
+  rep_acc <- t(apply(yrep_post, 1, function(yr) {
+    cummean(yr == agent_to_fit$category_feedback)
+  }))
+
+  ppc_summary <- tibble(
+    trial = seq_len(n_trials),
+    obs   = obs_acc,
+    q05   = apply(rep_acc, 2, quantile, 0.05),
+    q25   = apply(rep_acc, 2, quantile, 0.25),
+    q50   = apply(rep_acc, 2, quantile, 0.50),
+    q75   = apply(rep_acc, 2, quantile, 0.75),
+    q95   = apply(rep_acc, 2, quantile, 0.95)
+  )
+
+  ggplot(ppc_summary, aes(x = trial)) +
+    geom_ribbon(aes(ymin = q05, ymax = q95), fill = "#56B4E9", alpha = 0.20) +
+    geom_ribbon(aes(ymin = q25, ymax = q75), fill = "#56B4E9", alpha = 0.40) +
+    geom_line(aes(y = q50), color = "#0072B2", linewidth = 0.8) +
+    geom_line(aes(y = obs), color = "#D55E00", linewidth = 1) +
+    scale_y_continuous(limits = c(0, 1)) +
+    labs(
+      title    = "Posterior Predictive Check: Cumulative Accuracy",
+      subtitle = "Blue ribbons: 50% and 90% posterior predictive intervals\nOrange line: observed cumulative accuracy",
+      x = "Trial", y = "Cumulative Accuracy"
+    )
+}
+```
+
+```{r}
+if (!is.null(fit_gcm_single)) {
+  draws_df <- as_draws_df(
+    fit_gcm_single$draws(variables = c("w[1]", "w[2]", "w[3]", "w[4]", "w[5]", "log_c", "c", "bias"))
+  )
+
+  true_w1    <- agent_to_fit$w1_true[1]
+  true_w2    <- agent_to_fit$w2_true[1]
+  true_w3    <- agent_to_fit$w3_true[1]
+  true_w4    <- agent_to_fit$w4_true[1]
+  true_w5    <- agent_to_fit$w5_true[1]
+  true_log_c <- agent_to_fit$log_c_true[1]
+  true_c     <- agent_to_fit$c_true[1]
+  true_bias  <- agent_to_fit$bias_true[1]
+
+  set.seed(2026)
+  n_prior <- 4000
+  prior_df <- tibble(
+    `w[1]` = runif(n_prior),
+    `w[2]` = runif(n_prior),
+    `w[3]` = runif(n_prior),
+    `w[4]` = runif(n_prior),
+    `w[5]` = runif(n_prior),
+    log_c  = rnorm(n_prior, LOG_C_PRIOR_MEAN, LOG_C_PRIOR_SD),
+    c      = exp(log_c),
+    bias   = rbeta(n_prior, 1, 1)
+  )
+
+  pp_panel <- function(prior_x, post_x, true_val, label) {
+    tibble(
+      x      = c(prior_x, post_x),
+      source = c(rep("Prior", length(prior_x)),
+                 rep("Posterior", length(post_x)))
+    ) |>
+      ggplot(aes(x = x, fill = source, color = source)) +
+      geom_density(alpha = 0.4, linewidth = 0.5) +
+      geom_vline(xintercept = true_val, color = "red",
+                 linetype = "dashed", linewidth = 0.7) +
+      scale_fill_manual(values = c(Prior = "grey60", Posterior = "#0072B2")) +
+      scale_color_manual(values = c(Prior = "grey40", Posterior = "#0072B2")) +
+      labs(title = label, x = NULL, y = "Density") +
+      theme(legend.position = "bottom")
+  }
+
+  p1 <- pp_panel(prior_df$`w[1]`, draws_df$`w[1]`, true_w1, "w[1]")
+  p2 <- pp_panel(prior_df$`w[2]`, draws_df$`w[2]`, true_w2, "w[2]")
+  p3 <- pp_panel(prior_df$`w[3]`, draws_df$`w[3]`, true_w3, "w[3]")
+  p4 <- pp_panel(prior_df$`w[4]`, draws_df$`w[4]`, true_w4, "w[4]")
+  p5 <- pp_panel(prior_df$`w[5]`, draws_df$`w[5]`, true_w5, "w[5]")
+  p6 <- pp_panel(prior_df$log_c,  draws_df$log_c,  true_log_c, "log(c) — computational scale")
+  p7 <- pp_panel(prior_df$c,      draws_df$c,      true_c,     "c — natural scale")
+  p8 <- pp_panel(prior_df$bias,   draws_df$bias,   true_bias,  "bias")
+
+  (p1 | p2 | p3) / (p4 | p5 | p6) / (p7 | p8) +
+    plot_annotation(
+      title    = "Prior–Posterior Update for the Single-Subject GCM",
+      subtitle = "Red dashed line = true generating value"
+    )
+}
+
+```
+```{r}
+bayesplot::mcmc_pairs(
+  fit_gcm_single$draws(c("log_c", "w[1]", "w[2]", "w[3]", "w[4]", "w[5]", "bias")),
+  diag_fun     = "dens",
+  off_diag_fun = "hex"
+)
 ```
 
