@@ -1,0 +1,653 @@
+---
+title: "Data simulation"
+author: "Emma Rose Hahn"
+date: "2026-05-01"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+set.seed(020801)
+```
+
+```{r}
+# load packages
+
+pacman::p_load(
+  tidyverse, # Data manipulation and plotting
+  dplyr,
+  here,         # Robust file paths
+  cmdstanr, # Stan interface
+  ggplot2,     
+  posterior,    # Posterior analysis
+  bayesplot,
+  hrbrthemes, # Plotting MCMC
+  plan,
+  future, #for the plan function
+  furrr
+)
+```
+
+
+```{r}
+#defining distance
+
+distance <- function(vect1, vect2, w) {
+  sum(w * abs(vect1 - vect2)) #do we need to change victors to something?
+}
+
+#defining similarity 
+similarity <- function(dist_val, c) {
+  exp(-c * dist_val) 
+}
+
+
+# Generative GCM model function. idk im just testing things, this is largerly just riccardos code
+gcm_simulate <- function(w,            # attention weights (sums to 1)
+                         c,            # sensitivity (natural scale, strictly positive)
+                         bias,         # response bias towards category 1
+                         obs,          # matrix of stimulus features (trials x features) 
+                         cat_feedback, # true category labels (0 or 1)
+                         quiet = TRUE) {
+  ntrials   <- nrow(obs)
+  nfeatures <- ncol(obs)
+
+  prob_cat1    <- numeric(ntrials)
+  sim_response <- numeric(ntrials)
+
+  memory_obs <- matrix(NA_real_, nrow = 0, ncol = nfeatures)
+  memory_cat <- numeric(0)
+
+  for (i in seq_len(ntrials)) {
+    if (!quiet && i %% 20 == 0) cat("Simulating trial:", i, "\n")
+
+    current_stim <- as.numeric(obs[i, ])
+    n_mem        <- nrow(memory_obs)
+    has_cat0     <- any(memory_cat == 0)
+    has_cat1     <- any(memory_cat == 1)
+
+    if (n_mem == 0 || !has_cat0 || !has_cat1) {
+      prob_cat1[i] <- bias
+    } else {
+      sims <- vapply(seq_len(n_mem), function(e) {
+        similarity(distance(current_stim, memory_obs[e, ], w), c)
+      }, numeric(1))
+
+      # Mean similarity per category — removes category-frequency bias.
+      m1  <- mean(sims[memory_cat == 1])
+      m0  <- mean(sims[memory_cat == 0])
+      num <- bias * m1
+      den <- num + (1 - bias) * m0
+
+      prob_cat1[i] <- if (den > 1e-9) num / den else bias
+      prob_cat1[i] <- pmax(1e-9, pmin(1 - 1e-9, prob_cat1[i]))
+    }
+
+    sim_response[i] <- rbinom(1, 1, prob_cat1[i])
+
+    memory_obs <- rbind(memory_obs, current_stim)
+    memory_cat <- c(memory_cat, cat_feedback[i])
+  }
+
+  tibble(prob_cat1 = prob_cat1, sim_response = sim_response)
+}
+```
+
+```{r}
+#making the alien stimulus information
+n_aliens <- 32
+n_blocks <- 1
+n_trials_per_block <- n_aliens
+total_trials <- n_blocks * n_trials_per_block 
+
+stimulus_info <- tibble(
+  alien_id      = 1:32,
+  eye_stalks    = c(1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 0, 0, 1, 1, 1, 1, 0, 0, 1, 1, 1, 1, 0, 1, 1),
+  colour_green  = c(1, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 1, 1, 0, 0, 1, 0, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 0, 0),
+  slim_legs     = c(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 1, 1, 1, 0, 0, 0, 0, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1),
+  arms_up       = c(1, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 1, 0, 1, 1, 1, 1, 1, 0, 0, 1, 1, 1, 1, 0, 1, 0, 1, 0),
+  spots         = c(1, 0, 1, 0, 0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 1, 1, 1, 0, 1, 0, 0, 1, 1, 1, 1, 0, 1, 0, 1),
+  
+  category_true = c(eye_stalks == 1 & spots == 1) * 1
+)
+
+sum(stimulus_info$category_true)
+
+ggplot(stimulus_info, aes(x = eye_stalks, y = spots,
+                          color = factor(category_true), label = alien_id)) +
+  geom_point(size = 5) +
+  geom_text(nudge_y = 0.18) +
+  scale_color_manual(values = c("0" = "#0072B2", "1" = "#D55E00"), name = "Category") +
+  labs(title = "Stimulus Structure", x = "eye_stalks", y = "spots") +
+  coord_fixed()
+
+library(tidyverse)
+
+stimulus_info %>%
+  select(-category_true) %>%
+  pivot_longer(cols = -alien_id,
+               names_to = "feature", values_to = "value") %>%
+  ggplot(aes(x = feature, y = factor(alien_id), fill = factor(value))) +
+  geom_tile() +
+  scale_fill_manual(values = c("0" = "lightgreen", "1" = "hotpink"), name = "Value") +
+  labs(title = "Stimulus Features", x = "Feature", y = "Alien ID")
+```
+```{r}
+#subject schedule, i dont quite get it but just putting our stuff into riccardos code
+make_subject_schedule <- function(stimulus_info, n_blocks, seed) {
+  set.seed(020801) 
+  n_stim <- nrow(stimulus_info)
+
+  sequence <- unlist(lapply(seq_len(n_blocks), function(b) {
+    sample(stimulus_info$alien_id, n_stim, replace = FALSE) 
+  }))
+
+  tibble(
+    trial_within_subject = seq_along(sequence),
+    block                = rep(seq_len(n_blocks), each = n_stim),
+    alien_id             = sequence  
+  ) |>
+    left_join(stimulus_info, by = "alien_id") |> 
+    rename(category_feedback = category_true) |>
+    dplyr::select(trial_within_subject, block, alien_id,
+                  eye_stalks, colour_green, slim_legs, arms_up, spots, category_feedback)  # ← select actual columns
+}
+```
+
+```{r}
+#simulating a gcm agent 
+simulate_gcm_agent <- function(agent_id, w_true, c_true, bias_true,
+                               stimulus_info, n_blocks, subject_seed) {
+  schedule <- make_subject_schedule(stimulus_info, n_blocks, seed = subject_seed)
+  obs      <- schedule |> dplyr::select(eye_stalks, colour_green, slim_legs, arms_up, spots)
+  feedback <- schedule$category_feedback
+
+  sim_results <- gcm_simulate(
+    w = w_true, c = c_true, bias = bias_true,
+    obs = obs, cat_feedback = feedback, quiet = TRUE
+  )
+
+  schedule |>
+    mutate(
+      agent_id     = agent_id,
+      w1_true      = w_true[1],
+      w2_true      = w_true[2],
+      c_true       = c_true,
+      log_c_true   = log(c_true),
+      bias_true    = bias_true,
+      prob_cat1    = sim_results$prob_cat1,
+      sim_response = sim_results$sim_response,
+      correct      = as.integer(category_feedback == sim_response)
+    ) |>
+    group_by(agent_id) |>
+    mutate(performance = cumsum(correct) / row_number()) |>
+    ungroup()
+}
+```
+
+```{r}
+#SIMULATING DATA
+
+dir.create(here("simdata"), showWarnings = FALSE)
+
+sim_file <- here("simdata", "ch12_gcm_simulated_responses.csv")
+
+regenerate_simulations = TRUE
+
+param_grid <- expand_grid(
+  w_setting = list(
+    c(0.5, 0.125, 0.125, 0.125, 0.125),
+    c(0.7, 0.075, 0.075, 0.075, 0.075),
+    c(0.9, 0.025, 0.025, 0.025, 0.025)),
+  c_setting    = c(0.5, 1.0, 2.0, 4.0, 5.0, 15.0),
+  bias_setting = 0.5
+) |>
+  mutate(
+    setting_id = row_number(),
+    w_label = map_chr(w_setting, ~paste0("w1=", round(.x[1], 1))),
+    c_label    = paste0("c≈", round(c_setting, 1)),
+    label      = paste0("w=(", w_label, "), ", c_label)
+  )
+
+n_agents_per_setting <- 5
+
+simulation_plan <- param_grid |>
+  uncount(n_agents_per_setting) |>
+  mutate(agent_id = row_number())
+
+
+# using regular mapping bc it was throwing me errors
+
+simulated_responses <- pmap_dfr(
+  list(
+    agent_id  = simulation_plan$agent_id,
+    w_true    = simulation_plan$w_setting,
+    c_true    = simulation_plan$c_setting,
+    bias_true = simulation_plan$bias_setting
+  ),
+  simulate_gcm_agent,
+  stimulus_info = stimulus_info,
+  n_blocks      = n_blocks,
+  subject_seed  = simulation_plan$agent_id
+)
+
+write_csv(simulated_responses, sim_file)
+cat("Simulation complete. Results saved.\n")
+```
+
+```{r}
+#SIMULATED VIEWING
+simulated_responses_labeled <- simulated_responses |>
+  mutate(
+    w_label = paste0("w=(", round(w1_true, 2), ",", round(w2_true, 2), ")"),
+    c_label = paste0("c≈", round(c_true, 1)),
+    c_label = forcats::fct_reorder(c_label, c_true),
+    bias_label = paste0("bias=", round(bias_true, 2))
+  )
+
+p_c_effect <- ggplot(
+  simulated_responses_labeled,
+  aes(x = trial_within_subject, y = performance,
+      color = factor(round(c_true, 1)),
+      group = interaction(agent_id, round(c_true, 1)))
+) +
+  stat_summary(fun = mean, geom = "line",
+               aes(group = factor(round(c_true, 1))), linewidth = 1.2) +
+  facet_wrap(~w_label) +
+  scale_color_viridis_d(option = "plasma", name = "Sensitivity (c)") +
+  labs(
+    title    = "Effect of Sensitivity (c) on GCM Learning",
+    subtitle = "Mean cumulative accuracy across simulated agents",
+    x = "Trial", y = "Cumulative Accuracy"
+  ) +
+  theme_classic() +
+  theme(legend.position = "bottom")
+
+p_w_effect <- ggplot(
+  simulated_responses_labeled,
+  aes(x = trial_within_subject, y = performance,
+      color = w_label, group = interaction(agent_id, w_label))
+) +
+  stat_summary(fun = mean, geom = "line", aes(group = w_label), linewidth = 1.2) +
+  facet_wrap(~c_label) +
+  scale_color_brewer(palette = "Set1", name = "Attention Weights") +
+  labs(
+    title    = "Effect of Attention Weights (w) on GCM Learning",
+    subtitle = "Mean cumulative accuracy across simulated agents",
+    x = "Trial", y = "Cumulative Accuracy"
+  ) +
+  theme_classic() +
+  theme(legend.position = "bottom")
+
+print(p_c_effect)
+print(p_w_effect)
+
+#yayy 
+```
+
+
+```{r}
+#looking at performance over trial 
+
+# Define prior parameters
+LOG_C_PRIOR_MEAN <- log(2) #balanced sensitivity 
+LOG_C_PRIOR_SD <- 1
+
+# Generate prior samples
+n_prior_samples <- 500
+prior_draws <- tibble(
+  sample_id = seq_len(n_prior_samples),
+  log_c     = rnorm(n_prior_samples, LOG_C_PRIOR_MEAN, LOG_C_PRIOR_SD),
+  w1        = runif(n_prior_samples),
+  bias      = rbeta(n_prior_samples, 1, 1)
+) |>
+  mutate(c_true = exp(log_c), w2 = 1 - w1)
+
+# Create schedule for prior predictive check
+ppc_schedule <- make_subject_schedule(stimulus_info, n_blocks, seed = 999)
+
+# Generate prior predictive curves
+prior_pred_curves <- pmap_dfr(
+  list(
+    sample_id = prior_draws$sample_id,
+    log_c     = prior_draws$log_c,
+    w1        = prior_draws$w1,
+    bias      = prior_draws$bias
+  ),
+  function(sample_id, log_c, w1, bias) {
+    c <- exp(log_c)
+      w_rest <- (1 - w1) / 4
+      sim <- gcm_simulate(
+      w = c(w1, w_rest, w_rest, w_rest, w_rest), c = c, bias = bias,
+      obs          = ppc_schedule |> dplyr::select(eye_stalks, colour_green, slim_legs, arms_up, spots),
+      cat_feedback = ppc_schedule$category_feedback
+    )
+    tibble(
+      sample_id = sample_id,
+      trial     = seq_len(nrow(ppc_schedule)),
+      correct   = as.integer(sim$sim_response == ppc_schedule$category_feedback)
+    ) |>
+      mutate(cum_acc = cumsum(correct) / row_number())
+  }
+)
+
+# Summarize prior predictive
+prior_pred_summary <- prior_pred_curves |>
+  group_by(trial) |>
+  summarise(
+    q05 = quantile(cum_acc, 0.05),
+    q25 = quantile(cum_acc, 0.25),
+    q50 = median(cum_acc),
+    q75 = quantile(cum_acc, 0.75),
+    q95 = quantile(cum_acc, 0.95),
+    .groups = "drop"
+  )
+
+# Plot
+ggplot(prior_pred_summary, aes(x = trial)) +
+  geom_ribbon(aes(ymin = q05, ymax = q95), fill = "#56B4E9", alpha = 0.20) +
+  geom_ribbon(aes(ymin = q25, ymax = q75), fill = "#56B4E9", alpha = 0.40) +
+  geom_line(aes(y = q50), color = "#0072B2", linewidth = 1) +
+  geom_hline(yintercept = 0.5, linetype = "dashed", color = "grey40") +
+  scale_y_continuous(limits = c(0, 1)) +
+  labs(
+    title    = "Prior Predictive Check: GCM Learning Curves",
+    subtitle = "Ribbons: 50% and 90% prior predictive intervals; line: median\nPriors: log(c) ~ Normal(log 2, 1),  w ~ Uniform,  bias ~ Beta(1,1)",
+    x = "Trial", y = "Cumulative Accuracy"
+  ) +
+  theme_classic()  
+```
+
+#Look at the empirical data
+```{r}
+# ── Load & prep empirical data ──────────────────────────────────────────────
+alien_empirical <- read_csv(here("AlienData.txt")) %>%
+  # binary collapse: responses 3/4 = said dangerous, 1/2 = said safe
+  mutate(
+    resp_danger  = as.integer(response %in% c(3, 4)),
+    danger_correct = as.integer(resp_danger == dangerous)
+  )
+
+# Session 1, Cycle 1 only — first 32 trials per participant
+s1c1 <- alien_empirical %>%
+  filter(session == 1, cycle == 1)
+```
+```{r}
+# ── Summary statistics ───────────────────────────────────────────────────────
+# Per-participant accuracy
+subj_acc <- s1c1 %>%
+  group_by(subject, condition) %>%
+  summarise(
+    n_trials   = n(),
+    accuracy   = mean(danger_correct),
+    hit_rate   = mean(resp_danger[dangerous == 1]),
+    fa_rate    = mean(resp_danger[dangerous == 0]),
+    .groups    = "drop"
+  )
+
+# Group-level summary
+group_summary <- subj_acc %>%
+  summarise(
+    mean_acc = mean(accuracy),
+    sd_acc   = sd(accuracy),
+    min_acc  = min(accuracy),
+    max_acc  = max(accuracy),
+    mean_hit = mean(hit_rate),
+    sd_hit   = sd(hit_rate),
+    mean_fa  = mean(fa_rate),
+    sd_fa    = sd(fa_rate)
+  )
+
+majority_baseline <- mean(s1c1$dangerous == 0)
+
+cat("=== Group-level summary (Session 1, Cycle 1) ===\n")
+cat("Majority-class baseline (always say safe):", round(majority_baseline, 3), "\n")
+cat("Mean accuracy:  ", round(group_summary$mean_acc, 3),
+    " (SD =", round(group_summary$sd_acc, 3), ")\n")
+cat("Range:          ", round(group_summary$min_acc, 3),
+    "–", round(group_summary$max_acc, 3), "\n")
+cat("Mean hit rate:  ", round(group_summary$mean_hit, 3),
+    " (SD =", round(group_summary$sd_hit, 3), ")\n")
+cat("Mean FA rate:   ", round(group_summary$mean_fa, 3),
+    " (SD =", round(group_summary$sd_fa, 3), ")\n")
+```
+```{r}
+# ── Learning curve: accuracy over trial position ─────────────────────────────
+trial_acc <- s1c1 %>%
+  group_by(subject) %>%
+  arrange(trial) %>%
+  mutate(
+    trial_in_cycle = row_number(),
+    cum_acc        = cumsum(danger_correct) / row_number()
+  ) %>%
+  ungroup()
+
+trial_summary <- trial_acc %>%
+  group_by(trial_in_cycle) %>%
+  summarise(
+    mean_cum = mean(cum_acc),
+    sd_cum   = sd(cum_acc),
+    se_cum   = sd_cum / sqrt(n()),
+    .groups  = "drop"
+  )
+
+p_learning <- ggplot() +
+  # individual lines
+  geom_line(
+    data = trial_acc,
+    aes(x = trial_in_cycle, y = cum_acc, group = subject),
+    colour = "grey70", linewidth = 0.3, alpha = 0.6
+  ) +
+  # group mean + SE ribbon
+  geom_ribbon(
+    data = trial_summary,
+    aes(x = trial_in_cycle,
+        ymin = mean_cum - se_cum,
+        ymax = mean_cum + se_cum),
+    fill = "#0072B2", alpha = 0.25
+  ) +
+  geom_line(
+    data = trial_summary,
+    aes(x = trial_in_cycle, y = mean_cum),
+    colour = "#0072B2", linewidth = 1.2
+  ) +
+  geom_hline(yintercept = majority_baseline,
+             linetype = "dotted", colour = "#D55E00", linewidth = 0.8) +
+  geom_hline(yintercept = 0.5,
+             linetype = "dashed", colour = "grey40") +
+  annotate("text", x = 30, y = majority_baseline + 0.02,
+           label = "Majority baseline", colour = "#D55E00", size = 3) +
+  scale_y_continuous(limits = c(0, 1)) +
+  labs(
+    title    = "Empirical learning curves — Session 1, Cycle 1",
+    subtitle = "Grey lines = individual participants | Blue = group mean ± SE",
+    x = "Trial", y = "Cumulative accuracy (danger dimension)"
+  ) +
+  theme_classic(base_size = 12)
+
+p_learning
+```
+
+```{r}
+# ── Hit rate vs false alarm rate per participant (signal detection view) ──────
+p_hits_fa <- ggplot(subj_acc,
+                    aes(x = fa_rate, y = hit_rate,
+                        colour = factor(condition))) +
+  geom_abline(slope = 1, intercept = 0,
+              linetype = "dashed", colour = "grey60") +
+  geom_point(size = 3, alpha = 0.85) +
+  geom_vline(xintercept = mean(subj_acc$fa_rate),
+             linetype = "dotted", colour = "grey40") +
+  geom_hline(yintercept = mean(subj_acc$hit_rate),
+             linetype = "dotted", colour = "grey40") +
+  scale_colour_manual(
+    values = c("1" = "#0072B2", "2" = "#D55E00"),
+    labels = c("1" = "Dyads", "2" = "Individuals"),
+    name   = "Condition"
+  ) +
+  scale_x_continuous(limits = c(0, 1)) +
+  scale_y_continuous(limits = c(0, 1)) +
+  labs(
+    title    = "Hit rate vs false alarm rate per participant",
+    subtitle = "Points above the diagonal = better than chance discrimination",
+    x = "False alarm rate (safe → dangerous)",
+    y = "Hit rate (dangerous → dangerous)"
+  ) +
+  theme_classic(base_size = 12)
+
+p_hits_fa
+```
+
+```{r}
+# ── Distribution of per-participant accuracy ──────────────────────────────────
+p_acc_dist <- ggplot(subj_acc, aes(x = accuracy)) +
+  geom_histogram(binwidth = 0.05, fill = "#0072B2",
+                 colour = "white", alpha = 0.85) +
+  geom_vline(xintercept = majority_baseline,
+             linetype = "dotted", colour = "#D55E00", linewidth = 1) +
+  geom_vline(xintercept = mean(subj_acc$accuracy),
+             linetype = "dashed", colour = "grey20", linewidth = 1) +
+  annotate("text", x = majority_baseline + 0.02,
+           y = 19.5, label = "Majority\nbaseline",
+           colour = "#D55E00", size = 3, hjust = 0) +
+  annotate("text", x = mean(subj_acc$accuracy) + 0.02,
+           y = 20.5, label = "Mean\naccuracy",
+           colour = "grey20", size = 3, hjust = 0) +
+  scale_x_continuous(limits = c(0, 1)) +
+  labs(
+    title = "Distribution of participant accuracy",
+    subtitle = "Session 1, Cycle 1 — danger dimension",
+    x = "Accuracy", y = "Count"
+  ) +
+  theme_classic(base_size = 12)
+
+p_acc_dist
+```
+
+```{r}
+# ── Response breakdown by true category ──────────────────────────────────────
+resp_by_cat <- s1c1 %>%
+  mutate(
+    true_cat  = factor(dangerous,
+                       levels = c(0, 1),
+                       labels = c("True: Safe", "True: Dangerous")),
+    said_danger = factor(resp_danger,
+                         levels = c(0, 1),
+                         labels = c("Said: Safe", "Said: Dangerous"))
+  ) %>%
+  count(true_cat, said_danger) %>%
+  group_by(true_cat) %>%
+  mutate(prop = n / sum(n)) %>%
+  ungroup()
+
+p_resp <- ggplot(resp_by_cat,
+                 aes(x = said_danger, y = prop,
+                     fill = said_danger)) +
+  geom_col(width = 0.6, alpha = 0.9) +
+  geom_text(aes(label = scales::percent(prop, accuracy = 1)),
+            vjust = -0.4, size = 3.5) +
+  facet_wrap(~true_cat) +
+  scale_fill_manual(
+    values = c("Said: Safe" = "#0072B2", "Said: Dangerous" = "#D55E00"),
+    guide  = "none"
+  ) +
+  scale_y_continuous(limits = c(0, 1),
+                     labels = scales::percent_format()) +
+  labs(
+    title    = "Response rates by true category",
+    subtitle = "Session 1, Cycle 1",
+    x = NULL, y = "Proportion of responses"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(strip.text = element_text(face = "bold"))
+
+p_resp
+```
+
+```{r}
+# ── Confusion matrix heatmap ──────────────────────────────────────────────────
+conf_matrix <- s1c1 %>%
+  mutate(
+    true_cat = factor(dangerous,
+                      levels = c(0, 1),
+                      labels = c("Safe", "Dangerous")),
+    pred_cat = factor(resp_danger,
+                      levels = c(0, 1),
+                      labels = c("Safe", "Dangerous"))
+  ) %>%
+  count(true_cat, pred_cat) %>%
+  group_by(true_cat) %>%
+  mutate(prop = n / sum(n)) %>%
+  ungroup() %>%
+  mutate(
+    label = paste0(n, "\n(", scales::percent(prop, accuracy = 0.1), ")")
+  )
+
+p_confusion <- ggplot(conf_matrix,
+                      aes(x = pred_cat, y = true_cat, fill = prop)) +
+  geom_tile(colour = "white", linewidth = 1.5) +
+  geom_text(aes(label = label), size = 4.5, fontface = "bold") +
+  scale_fill_gradient(
+    low  = "#d9eaf7",
+    high = "#0072B2",
+    name = "Proportion\nwithin true class",
+    limits = c(0, 1)
+  ) +
+  scale_x_discrete(position = "top") +
+  labs(
+    title    = "Confusion matrix — empirical responses",
+    subtitle = "Session 1, Cycle 1 | Rows = true category, Columns = response category",
+    x = "Predicted (response)",
+    y = "True category"
+  ) +
+  theme_classic(base_size = 13) +
+  theme(
+    axis.text      = element_text(size = 12, face = "bold"),
+    axis.title     = element_text(size = 11),
+    legend.position = "right",
+    panel.grid     = element_blank()
+  )
+
+p_confusion
+```
+```{r}
+# ── Empirical learning curve — styled to match prior predictive ───────────────
+trial_acc_c1 <- s1c1 %>%
+  group_by(subject) %>%
+  arrange(trial) %>%
+  mutate(
+    trial_in_cycle = row_number(),
+    cum_acc        = cumsum(danger_correct) / row_number()
+  ) %>%
+  ungroup()
+
+trial_summary_c1 <- trial_acc_c1 %>%
+  group_by(trial_in_cycle) %>%
+  summarise(
+    q05 = quantile(cum_acc, 0.05),
+    q25 = quantile(cum_acc, 0.25),
+    q50 = median(cum_acc),
+    q75 = quantile(cum_acc, 0.75),
+    q95 = quantile(cum_acc, 0.95),
+    .groups = "drop"
+  )
+
+ggplot(trial_summary_c1, aes(x = trial_in_cycle)) +
+  geom_ribbon(aes(ymin = q05, ymax = q95),
+              fill = "#56B4E9", alpha = 0.20) +
+  geom_ribbon(aes(ymin = q25, ymax = q75),
+              fill = "#56B4E9", alpha = 0.40) +
+  geom_line(aes(y = q50),
+            colour = "#0072B2", linewidth = 1) +
+  geom_hline(yintercept = 0.5,
+             linetype = "dashed", colour = "grey40") +
+  scale_y_continuous(limits = c(0, 1)) +
+  scale_x_continuous(limits = c(0, 32)) +
+  labs(
+    title    = "Empirical GCM Learning Curves",
+    subtitle = "Ribbons: 50% and 90% intervals across participants; line: median\nSession 1, Cycle 1 — danger dimension",
+    x = "Trial", y = "Cumulative Accuracy"
+  ) +
+  theme_classic()
+```
+
