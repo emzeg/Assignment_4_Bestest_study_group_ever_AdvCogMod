@@ -364,15 +364,15 @@ print(p_w_effect)
 
 # Define prior parameters
 LOG_C_PRIOR_MEAN <- log(2) #balanced sensitivity 
-LOG_C_PRIOR_SD <- 1
+LOG_C_PRIOR_SD <- 0.5
 
 # Generate prior samples
 n_prior_samples <- 500
 prior_draws <- tibble(
   sample_id = seq_len(n_prior_samples),
   log_c     = rnorm(n_prior_samples, LOG_C_PRIOR_MEAN, LOG_C_PRIOR_SD),
-  w         = replicate(n_prior_samples, rep(0.2, 5), simplify = FALSE),
-  bias      = rbeta(n_prior_samples, 1, 1)
+  w         = replicate(n_prior_samples, c(0.5, 0.25, 0.15, 0.07, 0.03), simplify = FALSE),
+  bias      = rbeta(n_prior_samples, 5, 5)
 ) |>
   mutate(c_true = exp(log_c))
 
@@ -425,7 +425,7 @@ ggplot(prior_pred_summary, aes(x = trial)) +
   scale_y_continuous(limits = c(0, 1)) +
   labs(
     title    = "Prior Predictive Check: GCM Learning Curves",
-    subtitle = "Ribbons: 50% and 90% prior predictive intervals; line: median\nPriors: log(c) ~ Normal(log 2, 1),  w ~ Uniform,  bias ~ Beta(1,1)",
+    subtitle = "Ribbons: 50% and 90% prior predictive intervals; line: median\nPriors: log(c) ~ Normal(2, 0.5),  w ~ Asymmetric,  bias ~ Beta(5,5)",
     x = "Trial", y = "Cumulative Accuracy"
   ) +
   theme_classic()  
